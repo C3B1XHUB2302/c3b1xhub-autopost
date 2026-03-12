@@ -121,42 +121,6 @@ def auto_post(token_data):
         t.start()
     posting_threads[token_name] = channel_threads
 
-# =================== PREMIUM ADMIN ROUTES ===================
-@app.route('/admin/set-premium/<did>', methods=['POST'])
-@admin_required
-def admin_set_premium(did):
-    plan = request.form.get('plan')
-    if plan not in PREMIUM_PLANS:
-        flash('Plan tidak valid.', 'danger')
-        return redirect('/admin')
-    p        = PREMIUM_PLANS[plan]
-    expires  = time.time() + p['duration']
-    admin_id = session.get('user', {}).get('discord_id', 'unknown')
-    conn     = get_db()
-    user_row = conn.execute('SELECT username FROM users WHERE discord_id=?', (did,)).fetchone()
-    uname    = user_row['username'] if user_row else 'Unknown'
-    conn.execute('UPDATE users SET premium_type=?, premium_expires=? WHERE discord_id=?', (plan, expires, did))
-    conn.execute(
-        'INSERT INTO premium_log (discord_id, username, plan, price, granted_by, expires_at, created_at) VALUES (?,?,?,?,?,?,?)',
-        (did, uname, plan, p['price'], admin_id, expires, time.time())
-    )
-    conn.commit()
-    conn.close()
-    flash(f"✅ Premium <strong>{p['label']}</strong> ({p['price_fmt']}) berhasil diaktifkan untuk <strong>{uname}</strong>! Expires: {datetime.fromtimestamp(expires).strftime('%d %b %Y %H:%M')}", 'success')
-    return redirect('/admin')
-
-@app.route('/admin/remove-premium/<did>', methods=['POST'])
-@admin_required
-def admin_remove_premium(did):
-    conn     = get_db()
-    user_row = conn.execute('SELECT username FROM users WHERE discord_id=?', (did,)).fetchone()
-    uname    = user_row['username'] if user_row else 'Unknown'
-    conn.execute('UPDATE users SET premium_type=NULL, premium_expires=0 WHERE discord_id=?', (did,))
-    conn.commit()
-    conn.close()
-    flash(f"🗑️ Premium user <strong>{uname}</strong> telah dihapus.", 'warning')
-    return redirect('/admin')
-
 # =================== DATABASE ===================
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else '.', exist_ok=True)
@@ -503,6 +467,44 @@ def admin_delete(did):
     conn.commit()
     conn.close()
     flash(f"User {did} has been deleted.", 'success')
+    return redirect('/admin')
+
+# =================== PREMIUM ADMIN ROUTES ===================
+@app.route('/admin/set-premium/<did>', methods=['POST'])
+@login_required
+@admin_required
+def admin_set_premium(did):
+    plan = request.form.get('plan')
+    if plan not in PREMIUM_PLANS:
+        flash('Plan tidak valid.', 'danger')
+        return redirect('/admin')
+    p        = PREMIUM_PLANS[plan]
+    expires  = time.time() + p['duration']
+    admin_id = session.get('user', {}).get('discord_id', 'unknown')
+    conn     = get_db()
+    user_row = conn.execute('SELECT username FROM users WHERE discord_id=?', (did,)).fetchone()
+    uname    = user_row['username'] if user_row else 'Unknown'
+    conn.execute('UPDATE users SET premium_type=?, premium_expires=? WHERE discord_id=?', (plan, expires, did))
+    conn.execute(
+        'INSERT INTO premium_log (discord_id, username, plan, price, granted_by, expires_at, created_at) VALUES (?,?,?,?,?,?,?)',
+        (did, uname, plan, p['price'], admin_id, expires, time.time())
+    )
+    conn.commit()
+    conn.close()
+    flash(f"✅ Premium <strong>{p['label']}</strong> ({p['price_fmt']}) berhasil diaktifkan untuk <strong>{uname}</strong>! Expires: {datetime.fromtimestamp(expires).strftime('%d %b %Y %H:%M')}", 'success')
+    return redirect('/admin')
+
+@app.route('/admin/remove-premium/<did>', methods=['POST'])
+@login_required
+@admin_required
+def admin_remove_premium(did):
+    conn     = get_db()
+    user_row = conn.execute('SELECT username FROM users WHERE discord_id=?', (did,)).fetchone()
+    uname    = user_row['username'] if user_row else 'Unknown'
+    conn.execute('UPDATE users SET premium_type=NULL, premium_expires=0 WHERE discord_id=?', (did,))
+    conn.commit()
+    conn.close()
+    flash(f"🗑️ Premium user <strong>{uname}</strong> telah dihapus.", 'warning')
     return redirect('/admin')
 
 # =================== MAIN APP ROUTES ===================
