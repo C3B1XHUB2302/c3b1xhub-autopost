@@ -158,7 +158,7 @@ def init_db():
             timestamp  REAL
         );
     ''')
-        conn.commit()
+    conn.commit()
     # Migration: tambah kolom premium jika DB sudah ada sebelumnya
     try:
         conn.execute("ALTER TABLE users ADD COLUMN premium_type TEXT DEFAULT NULL")
