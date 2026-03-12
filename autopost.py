@@ -618,6 +618,7 @@ login_template = '''
 <title>C3B1XHUB — Login</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/brands.min.css">
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 :root{--red:#e8000d;--red-dark:#a30009;--red-glow:rgba(232,0,13,.5);--bg:#080808;--bg2:#111;--border:rgba(232,0,13,.22);--text:#eee;--muted:#777}
@@ -732,6 +733,7 @@ register_token_template = '''
 <title>C3B1XHUB — Add Token</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/brands.min.css">
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 :root{--red:#e8000d;--red-dark:#a30009;--red-glow:rgba(232,0,13,.5);--bg:#080808;--bg2:#111;--border:rgba(232,0,13,.22);--text:#eee;--muted:#777}
@@ -814,6 +816,7 @@ admin_template = '''
 <title>C3B1XHUB — Admin Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/brands.min.css">
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 :root{--red:#e8000d;--red-dark:#a30009;--red-glow:rgba(232,0,13,.45);--bg:#070707;--bg2:#101010;--bg3:#181818;--border:rgba(232,0,13,.18);--border2:rgba(255,255,255,.07);--text:#eee;--dim:#aaa;--muted:#666;--green:#22c55e;--blue:#3b82f6;--yellow:#f59e0b;--sw:260px}
@@ -1187,6 +1190,7 @@ html_template = '''
 <title>C3B1XHUB — {{ current_token_data.name }}</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/brands.min.css">
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 :root{
