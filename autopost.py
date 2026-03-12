@@ -158,6 +158,16 @@ def init_db():
             timestamp  REAL
         );
     ''')
+        conn.commit()
+    # Migration: tambah kolom premium jika DB sudah ada sebelumnya
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN premium_type TEXT DEFAULT NULL")
+    except:
+        pass
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN premium_expires REAL DEFAULT 0")
+    except:
+        pass
     conn.commit()
     conn.close()
 
@@ -425,16 +435,6 @@ def admin_ban(did):
     conn   = get_db()
     user   = conn.execute('SELECT * FROM users WHERE discord_id=?', (did,)).fetchone()
     conn.execute('UPDATE users SET is_banned=1, ban_reason=? WHERE discord_id=?', (reason, did))
-        conn.commit()
-    # Migration: tambah kolom premium jika belum ada (untuk DB lama)
-    try:
-        conn.execute("ALTER TABLE users ADD COLUMN premium_type TEXT DEFAULT NULL")
-    except:
-        pass
-    try:
-        conn.execute("ALTER TABLE users ADD COLUMN premium_expires REAL DEFAULT 0")
-    except:
-        pass
     conn.commit()
     conn.close()
     if user:
