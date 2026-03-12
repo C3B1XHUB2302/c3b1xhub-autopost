@@ -10,6 +10,10 @@ from urllib.parse import urlencode
 
 app = Flask(__name__)
 
+@app.template_filter('datetimeformat')
+def datetimeformat(value):
+    return datetime.fromtimestamp(int(value)).strftime('%d %b %Y %H:%M')
+
 # =================== ENVIRONMENT / CONFIG ===================
 IS_VERCEL  = bool(os.environ.get('VERCEL'))
 BASE_DIR   = '/tmp' if IS_VERCEL else '.'
@@ -117,21 +121,69 @@ def auto_post(token_data):
         t.start()
     posting_threads[token_name] = channel_threads
 
+# =================== PREMIUM ADMIN ROUTES ===================
+@app.route('/admin/set-premium/<did>', methods=['POST'])
+@admin_required
+def admin_set_premium(did):
+    plan = request.form.get('plan')
+    if plan not in PREMIUM_PLANS:
+        flash('Plan tidak valid.', 'danger')
+        return redirect('/admin')
+    p        = PREMIUM_PLANS[plan]
+    expires  = time.time() + p['duration']
+    admin_id = session.get('user', {}).get('discord_id', 'unknown')
+    conn     = get_db()
+    user_row = conn.execute('SELECT username FROM users WHERE discord_id=?', (did,)).fetchone()
+    uname    = user_row['username'] if user_row else 'Unknown'
+    conn.execute('UPDATE users SET premium_type=?, premium_expires=? WHERE discord_id=?', (plan, expires, did))
+    conn.execute(
+        'INSERT INTO premium_log (discord_id, username, plan, price, granted_by, expires_at, created_at) VALUES (?,?,?,?,?,?,?)',
+        (did, uname, plan, p['price'], admin_id, expires, time.time())
+    )
+    conn.commit()
+    conn.close()
+    flash(f"✅ Premium <strong>{p['label']}</strong> ({p['price_fmt']}) berhasil diaktifkan untuk <strong>{uname}</strong>! Expires: {datetime.fromtimestamp(expires).strftime('%d %b %Y %H:%M')}", 'success')
+    return redirect('/admin')
+
+@app.route('/admin/remove-premium/<did>', methods=['POST'])
+@admin_required
+def admin_remove_premium(did):
+    conn     = get_db()
+    user_row = conn.execute('SELECT username FROM users WHERE discord_id=?', (did,)).fetchone()
+    uname    = user_row['username'] if user_row else 'Unknown'
+    conn.execute('UPDATE users SET premium_type=NULL, premium_expires=0 WHERE discord_id=?', (did,))
+    conn.commit()
+    conn.close()
+    flash(f"🗑️ Premium user <strong>{uname}</strong> telah dihapus.", 'warning')
+    return redirect('/admin')
+
 # =================== DATABASE ===================
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else '.', exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS users (
-            discord_id  TEXT PRIMARY KEY,
+            discord_id      TEXT PRIMARY KEY,
+            username        TEXT,
+            global_name     TEXT,
+            avatar          TEXT,
+            login_count     INTEGER DEFAULT 1,
+            first_login     REAL,
+            last_login      REAL,
+            is_banned       INTEGER DEFAULT 0,
+            ban_reason      TEXT DEFAULT "",
+            premium_type    TEXT DEFAULT NULL,
+            premium_expires REAL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS premium_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id  TEXT,
             username    TEXT,
-            global_name TEXT,
-            avatar      TEXT,
-            login_count INTEGER DEFAULT 1,
-            first_login REAL,
-            last_login  REAL,
-            is_banned   INTEGER DEFAULT 0,
-            ban_reason  TEXT DEFAULT ""
+            plan        TEXT,
+            price       INTEGER,
+            granted_by  TEXT,
+            expires_at  REAL,
+            created_at  REAL
         );
         CREATE TABLE IF NOT EXISTS activity_log (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,6 +201,42 @@ def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+# =================== PREMIUM HELPERS ===================
+PREMIUM_PLANS = {
+    '1day':   {'label': '1 Hari',   'emoji': '⚡', 'price': 5000,   'duration': 86400,    'price_fmt': 'Rp 5.000'},
+    '1week':  {'label': '1 Minggu', 'emoji': '🔥', 'price': 20000,  'duration': 604800,   'price_fmt': 'Rp 20.000'},
+    '1month': {'label': '1 Bulan',  'emoji': '👑', 'price': 100000, 'duration': 2592000,  'price_fmt': 'Rp 100.000'},
+}
+FREE_TOKEN_LIMIT   = 1
+FREE_CHANNEL_LIMIT = 5
+
+def is_premium(discord_id):
+    if not discord_id or discord_id == 'local_dev':
+        return True  # local dev = bypass semua limit
+    conn = get_db()
+    row = conn.execute('SELECT premium_expires FROM users WHERE discord_id=?', (discord_id,)).fetchone()
+    conn.close()
+    if not row:
+        return False
+    return bool(row['premium_expires'] and row['premium_expires'] > time.time())
+
+def get_premium_info(discord_id):
+    if not discord_id or discord_id == 'local_dev':
+        return {'type': 'admin', 'label': 'Admin', 'expires': None, 'active': True}
+    conn = get_db()
+    row = conn.execute('SELECT premium_type, premium_expires FROM users WHERE discord_id=?', (discord_id,)).fetchone()
+    conn.close()
+    if not row or not row['premium_expires'] or row['premium_expires'] <= time.time():
+        return None
+    plan = PREMIUM_PLANS.get(row['premium_type'], {})
+    return {
+        'type':    row['premium_type'],
+        'label':   plan.get('label', row['premium_type']),
+        'emoji':   plan.get('emoji', '⭐'),
+        'expires': row['premium_expires'],
+        'active':  True
+    }
 
 # =================== DISCORD WEBHOOK LOG ===================
 def send_discord_log(action, user_data, ip='', extra_note=''):
@@ -362,7 +450,7 @@ def admin_dashboard():
         total_users=total_users, banned_users=banned_users,
         new_today=new_today, logins_today=logins_today,
         users=users, logs=logs, config=config,
-        ADMIN_IDS=ADMIN_IDS, datetime=datetime
+        ADMIN_IDS=ADMIN_IDS, datetime=datetime, now=time.time()
     )
 
 @app.route('/admin/ban/<did>', methods=['POST'])
@@ -373,6 +461,16 @@ def admin_ban(did):
     conn   = get_db()
     user   = conn.execute('SELECT * FROM users WHERE discord_id=?', (did,)).fetchone()
     conn.execute('UPDATE users SET is_banned=1, ban_reason=? WHERE discord_id=?', (reason, did))
+        conn.commit()
+    # Migration: tambah kolom premium jika belum ada (untuk DB lama)
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN premium_type TEXT DEFAULT NULL")
+    except:
+        pass
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN premium_expires REAL DEFAULT 0")
+    except:
+        pass
     conn.commit()
     conn.close()
     if user:
@@ -416,11 +514,23 @@ def index():
     if not config["tokens"] or config["current_token_index"] == -1:
         return redirect("/add-new-token")
     current_token_data = get_current_token_data()
+    user       = session.get('user', {})
+    discord_id = user.get('discord_id', '')
+    is_admin   = user.get('is_admin', False)
+    prem_info  = get_premium_info(discord_id)
+    user_is_premium = is_admin or is_premium(discord_id)
+    token_limit   = None if user_is_premium else FREE_TOKEN_LIMIT
+    channel_limit = None if user_is_premium else FREE_CHANNEL_LIMIT
     return render_template_string(
         html_template,
         config_json=json.dumps(current_token_data, indent=4),
         config=config, current_token_data=current_token_data,
-        editing=False
+        editing=False,
+        prem_info=prem_info,
+        user_is_premium=user_is_premium,
+        token_limit=token_limit,
+        channel_limit=channel_limit,
+        premium_plans=PREMIUM_PLANS
     )
 
 @app.route("/add-new-token", methods=["GET"])
@@ -434,6 +544,16 @@ def add_new_token_page():
 @login_required
 def register_token():
     global config
+    user       = session.get('user', {})
+    discord_id = user.get('discord_id', '')
+    is_admin   = user.get('is_admin', False)
+
+    # Cek limit token untuk user biasa (bukan admin & bukan premium)
+    if not is_admin and not is_premium(discord_id):
+        if len(config["tokens"]) >= FREE_TOKEN_LIMIT:
+            flash(f"❌ Batas token tercapai! User biasa hanya bisa menambahkan {FREE_TOKEN_LIMIT} token. Upgrade ke <strong>Premium</strong> untuk unlimited token.", "danger")
+            return redirect("/add-new-token")
+
     token_name  = request.form.get("token_name", "").strip()
     token_value = request.form.get("token", "").strip()
     if not token_name or not token_value:
@@ -513,6 +633,16 @@ def save():
         flash("Interval must be at least 1 second.", "danger")
         return redirect("/#channels")
     if action == "add":
+        user       = session.get('user', {})
+        discord_id = user.get('discord_id', '')
+        is_admin   = user.get('is_admin', False)
+
+        # Cek limit channel untuk user biasa
+        if not is_admin and not is_premium(discord_id):
+            if len(current_token_data["channels"]) >= FREE_CHANNEL_LIMIT:
+                flash(f"❌ Batas channel tercapai! User biasa hanya bisa menambahkan {FREE_CHANNEL_LIMIT} channel. Upgrade ke <strong>Premium</strong> untuk unlimited channel.", "danger")
+                return redirect("/#channels")
+
         if any(ch['id'] == channel_id for ch in current_token_data["channels"]):
             flash(f"Channel {channel_id} already exists!", "danger")
             return redirect("/#channels")
@@ -659,6 +789,28 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 .alert-info{border-left:3px solid #3b82f6}.alert-info i{color:#3b82f6}
 .alert-close{margin-left:auto;background:none;border:none;color:var(--muted);cursor:pointer;font-size:1rem}
 .footer-note{margin-top:1.5rem;font-size:.75rem;color:var(--muted);text-align:center}
+.prem-badge{display:inline-flex;align-items:center;gap:.4rem;padding:.25rem .7rem;border-radius:20px;font-size:.75rem;font-weight:700;letter-spacing:.5px}
+.prem-badge.free{background:rgba(255,255,255,.08);color:#aaa;border:1px solid rgba(255,255,255,.12)}
+.prem-badge.active{background:linear-gradient(135deg,#f59e0b,#d97706);color:#000;border:none;box-shadow:0 0 12px rgba(245,158,11,.4)}
+.prem-widget{background:#181818;border:1px solid rgba(245,158,11,.3);border-radius:14px;padding:1.2rem;margin-bottom:1rem}
+.prem-widget.free{border-color:rgba(255,255,255,.1)}
+.prem-plans{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.75rem;margin-top:1rem}
+.plan-card{border-radius:12px;padding:1rem;text-align:center;border:1px solid rgba(255,255,255,.1);background:#111}
+.plan-card .plan-emoji{font-size:1.6rem;display:block;margin-bottom:.4rem}
+.plan-card .plan-name{font-weight:700;font-size:.95rem;color:#eee}
+.plan-card .plan-price{color:#f59e0b;font-weight:700;font-size:1rem;margin:.3rem 0}
+.plan-card .plan-dur{color:#777;font-size:.78rem}
+.btn-buy{display:inline-block;margin-top:.6rem;padding:.35rem .9rem;background:linear-gradient(135deg,#f59e0b,#d97706);color:#000;border-radius:8px;font-weight:700;font-size:.8rem;border:none;cursor:pointer;text-decoration:none;transition:all .2s}
+.btn-buy:hover{filter:brightness(1.15);transform:translateY(-1px)}
+.limit-bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:.4rem;font-size:.82rem}
+.limit-track{background:rgba(255,255,255,.08);border-radius:4px;height:6px;flex:1;margin:0 .6rem}
+.limit-fill{height:100%;border-radius:4px;background:#e8000d;transition:width .4s}
+.limit-fill.ok{background:#22c55e}
+.limit-fill.warn{background:#f59e0b}
+.prem-admin-select{background:#181818;color:#eee;border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:.3rem .6rem;font-size:.8rem}
+.btn-prem-grant{background:linear-gradient(135deg,#f59e0b,#d97706);color:#000;border:none;border-radius:8px;padding:.3rem .8rem;font-size:.8rem;font-weight:700;cursor:pointer}
+.btn-prem-grant:hover{filter:brightness(1.1)}
+.btn-prem-remove{background:rgba(232,0,13,.2);color:#e8000d;border:1px solid rgba(232,0,13,.3);border-radius:8px;padding:.3rem .8rem;font-size:.8rem;cursor:pointer}
 </style>
 </head>
 <body>
@@ -766,6 +918,28 @@ input::placeholder{color:rgba(255,255,255,.18)}
 .alert-danger{border-left:3px solid var(--red)}.alert-danger i{color:var(--red)}
 .alert-warning{border-left:3px solid #f59e0b}.alert-warning i{color:#f59e0b}
 .alert-close{margin-left:auto;background:none;border:none;color:var(--muted);cursor:pointer;font-size:1rem}
+.prem-badge{display:inline-flex;align-items:center;gap:.4rem;padding:.25rem .7rem;border-radius:20px;font-size:.75rem;font-weight:700;letter-spacing:.5px}
+.prem-badge.free{background:rgba(255,255,255,.08);color:#aaa;border:1px solid rgba(255,255,255,.12)}
+.prem-badge.active{background:linear-gradient(135deg,#f59e0b,#d97706);color:#000;border:none;box-shadow:0 0 12px rgba(245,158,11,.4)}
+.prem-widget{background:#181818;border:1px solid rgba(245,158,11,.3);border-radius:14px;padding:1.2rem;margin-bottom:1rem}
+.prem-widget.free{border-color:rgba(255,255,255,.1)}
+.prem-plans{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.75rem;margin-top:1rem}
+.plan-card{border-radius:12px;padding:1rem;text-align:center;border:1px solid rgba(255,255,255,.1);background:#111}
+.plan-card .plan-emoji{font-size:1.6rem;display:block;margin-bottom:.4rem}
+.plan-card .plan-name{font-weight:700;font-size:.95rem;color:#eee}
+.plan-card .plan-price{color:#f59e0b;font-weight:700;font-size:1rem;margin:.3rem 0}
+.plan-card .plan-dur{color:#777;font-size:.78rem}
+.btn-buy{display:inline-block;margin-top:.6rem;padding:.35rem .9rem;background:linear-gradient(135deg,#f59e0b,#d97706);color:#000;border-radius:8px;font-weight:700;font-size:.8rem;border:none;cursor:pointer;text-decoration:none;transition:all .2s}
+.btn-buy:hover{filter:brightness(1.15);transform:translateY(-1px)}
+.limit-bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:.4rem;font-size:.82rem}
+.limit-track{background:rgba(255,255,255,.08);border-radius:4px;height:6px;flex:1;margin:0 .6rem}
+.limit-fill{height:100%;border-radius:4px;background:#e8000d;transition:width .4s}
+.limit-fill.ok{background:#22c55e}
+.limit-fill.warn{background:#f59e0b}
+.prem-admin-select{background:#181818;color:#eee;border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:.3rem .6rem;font-size:.8rem}
+.btn-prem-grant{background:linear-gradient(135deg,#f59e0b,#d97706);color:#000;border:none;border-radius:8px;padding:.3rem .8rem;font-size:.8rem;font-weight:700;cursor:pointer}
+.btn-prem-grant:hover{filter:brightness(1.1)}
+.btn-prem-remove{background:rgba(232,0,13,.2);color:#e8000d;border:1px solid rgba(232,0,13,.3);border-radius:8px;padding:.3rem .8rem;font-size:.8rem;cursor:pointer}
 </style>
 </head>
 <body>
@@ -940,6 +1114,28 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 .alert-warning{border-left:3px solid var(--yellow)}.alert-warning i{color:var(--yellow)}
 .alert-info{border-left:3px solid var(--blue)}.alert-info i{color:var(--blue)}
 .alert-close{margin-left:auto;background:none;border:none;color:var(--muted);cursor:pointer;font-size:1rem}
+.prem-badge{display:inline-flex;align-items:center;gap:.4rem;padding:.25rem .7rem;border-radius:20px;font-size:.75rem;font-weight:700;letter-spacing:.5px}
+.prem-badge.free{background:rgba(255,255,255,.08);color:#aaa;border:1px solid rgba(255,255,255,.12)}
+.prem-badge.active{background:linear-gradient(135deg,#f59e0b,#d97706);color:#000;border:none;box-shadow:0 0 12px rgba(245,158,11,.4)}
+.prem-widget{background:#181818;border:1px solid rgba(245,158,11,.3);border-radius:14px;padding:1.2rem;margin-bottom:1rem}
+.prem-widget.free{border-color:rgba(255,255,255,.1)}
+.prem-plans{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.75rem;margin-top:1rem}
+.plan-card{border-radius:12px;padding:1rem;text-align:center;border:1px solid rgba(255,255,255,.1);background:#111}
+.plan-card .plan-emoji{font-size:1.6rem;display:block;margin-bottom:.4rem}
+.plan-card .plan-name{font-weight:700;font-size:.95rem;color:#eee}
+.plan-card .plan-price{color:#f59e0b;font-weight:700;font-size:1rem;margin:.3rem 0}
+.plan-card .plan-dur{color:#777;font-size:.78rem}
+.btn-buy{display:inline-block;margin-top:.6rem;padding:.35rem .9rem;background:linear-gradient(135deg,#f59e0b,#d97706);color:#000;border-radius:8px;font-weight:700;font-size:.8rem;border:none;cursor:pointer;text-decoration:none;transition:all .2s}
+.btn-buy:hover{filter:brightness(1.15);transform:translateY(-1px)}
+.limit-bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:.4rem;font-size:.82rem}
+.limit-track{background:rgba(255,255,255,.08);border-radius:4px;height:6px;flex:1;margin:0 .6rem}
+.limit-fill{height:100%;border-radius:4px;background:#e8000d;transition:width .4s}
+.limit-fill.ok{background:#22c55e}
+.limit-fill.warn{background:#f59e0b}
+.prem-admin-select{background:#181818;color:#eee;border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:.3rem .6rem;font-size:.8rem}
+.btn-prem-grant{background:linear-gradient(135deg,#f59e0b,#d97706);color:#000;border:none;border-radius:8px;padding:.3rem .8rem;font-size:.8rem;font-weight:700;cursor:pointer}
+.btn-prem-grant:hover{filter:brightness(1.1)}
+.btn-prem-remove{background:rgba(232,0,13,.2);color:#e8000d;border:1px solid rgba(232,0,13,.3);border-radius:8px;padding:.3rem .8rem;font-size:.8rem;cursor:pointer}
 </style>
 </head>
 <body>
@@ -1064,6 +1260,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
                 <th>Last Seen</th>
                 <th>Status</th>
                 <th>Actions</th>
+                <th>Premium</th>
               </tr>
             </thead>
             <tbody>
@@ -1109,6 +1306,37 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
                     {% endif %}
                     <form method="post" action="/admin/delete/{{ u['discord_id'] }}" style="display:inline">
                       <button type="submit" class="btn-act ba-neutral" onclick="return confirm('Delete {{ u['username'] }} permanently?')"><i class="fas fa-trash"></i></button>
+                    </form>
+                  </div>
+                </td>
+                                <td>
+                  {% if u['premium_expires'] and u['premium_expires'] > now %}
+                    <div style="margin-bottom:.4rem">
+                      <span style="color:#f59e0b;font-size:.8rem;font-weight:700">
+                        👑 {{ u['premium_type'] }}
+                      </span><br>
+                      <span style="color:#aaa;font-size:.75rem">
+                        Exp: {{ u['premium_expires']|int|datetimeformat }}
+                      </span>
+                    </div>
+                    <form action="/admin/remove-premium/{{ u['discord_id'] }}" method="post" style="display:inline">
+                      <button type="submit" class="btn-prem-remove" onclick="return confirm('Hapus premium user ini?')">
+                        <i class="fas fa-times"></i> Hapus
+                      </button>
+                    </form>
+                  {% else %}
+                    <span style="color:#555;font-size:.8rem">— Free</span>
+                  {% endif %}
+                  <div style="display:flex;gap:.3rem;align-items:center;margin-top:.4rem;flex-wrap:wrap">
+                    <form action="/admin/set-premium/{{ u['discord_id'] }}" method="post" style="display:contents">
+                      <select name="plan" class="prem-admin-select">
+                        <option value="1day">⚡ 1 Hari — Rp5rb</option>
+                        <option value="1week">🔥 1 Minggu — Rp20rb</option>
+                        <option value="1month">👑 1 Bulan — Rp100rb</option>
+                      </select>
+                      <button type="submit" class="btn-prem-grant">
+                        <i class="fas fa-star"></i> Grant
+                      </button>
                     </form>
                   </div>
                 </td>
@@ -1375,6 +1603,28 @@ textarea{resize:vertical;min-height:95px}
 @media(max-width:900px){.sb-open .overlay{display:block}}
 hr{border:none;border-top:1px solid var(--border2);margin:1.25rem 0}
 p{line-height:1.7;color:var(--dim);margin-bottom:.75rem}
+.prem-badge{display:inline-flex;align-items:center;gap:.4rem;padding:.25rem .7rem;border-radius:20px;font-size:.75rem;font-weight:700;letter-spacing:.5px}
+.prem-badge.free{background:rgba(255,255,255,.08);color:#aaa;border:1px solid rgba(255,255,255,.12)}
+.prem-badge.active{background:linear-gradient(135deg,#f59e0b,#d97706);color:#000;border:none;box-shadow:0 0 12px rgba(245,158,11,.4)}
+.prem-widget{background:#181818;border:1px solid rgba(245,158,11,.3);border-radius:14px;padding:1.2rem;margin-bottom:1rem}
+.prem-widget.free{border-color:rgba(255,255,255,.1)}
+.prem-plans{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.75rem;margin-top:1rem}
+.plan-card{border-radius:12px;padding:1rem;text-align:center;border:1px solid rgba(255,255,255,.1);background:#111}
+.plan-card .plan-emoji{font-size:1.6rem;display:block;margin-bottom:.4rem}
+.plan-card .plan-name{font-weight:700;font-size:.95rem;color:#eee}
+.plan-card .plan-price{color:#f59e0b;font-weight:700;font-size:1rem;margin:.3rem 0}
+.plan-card .plan-dur{color:#777;font-size:.78rem}
+.btn-buy{display:inline-block;margin-top:.6rem;padding:.35rem .9rem;background:linear-gradient(135deg,#f59e0b,#d97706);color:#000;border-radius:8px;font-weight:700;font-size:.8rem;border:none;cursor:pointer;text-decoration:none;transition:all .2s}
+.btn-buy:hover{filter:brightness(1.15);transform:translateY(-1px)}
+.limit-bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:.4rem;font-size:.82rem}
+.limit-track{background:rgba(255,255,255,.08);border-radius:4px;height:6px;flex:1;margin:0 .6rem}
+.limit-fill{height:100%;border-radius:4px;background:#e8000d;transition:width .4s}
+.limit-fill.ok{background:#22c55e}
+.limit-fill.warn{background:#f59e0b}
+.prem-admin-select{background:#181818;color:#eee;border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:.3rem .6rem;font-size:.8rem}
+.btn-prem-grant{background:linear-gradient(135deg,#f59e0b,#d97706);color:#000;border:none;border-radius:8px;padding:.3rem .8rem;font-size:.8rem;font-weight:700;cursor:pointer}
+.btn-prem-grant:hover{filter:brightness(1.1)}
+.btn-prem-remove{background:rgba(232,0,13,.2);color:#e8000d;border:1px solid rgba(232,0,13,.3);border-radius:8px;padding:.3rem .8rem;font-size:.8rem;cursor:pointer}
 </style>
 </head>
 <body>
@@ -1616,17 +1866,61 @@ p{line-height:1.7;color:var(--dim);margin-bottom:.75rem}
           <p>This tool automates posting messages to Discord channels using multiple bot tokens. Manage multiple bots, each with their own channels, custom messages, and posting intervals.</p>
           <p>Built with Flask and crafted for simplicity. Supports Discord OAuth2 login and admin panel.</p>
           <hr>
+          <!-- PREMIUM WIDGET -->
+{% if user_is_premium %}
+<div class="prem-widget" style="margin-bottom:1rem">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem">
+    <div>
+      <span class="prem-badge active">
+        {{ prem_info.emoji if prem_info else '👑' }} PREMIUM {{ prem_info.label if prem_info else 'ADMIN' }}
+      </span>
+    </div>
+    {% if prem_info and prem_info.expires %}
+    <div style="font-size:.78rem;color:#aaa">
+      <i class="fas fa-clock"></i> Expires {{ prem_info.expires | int | datetimeformat if prem_info.expires else '' }}
+    </div>
+    {% endif %}
+  </div>
+  <div style="margin-top:.6rem;font-size:.82rem;color:#aaa"><i class="fas fa-infinity"></i> Unlimited Token &nbsp;·&nbsp; <i class="fas fa-infinity"></i> Unlimited Channel</div>
+</div>
+{% else %}
+<div class="prem-widget free" style="margin-bottom:1rem">
+  <div style="display:flex;align-items:center;justify-content:space-between">
+    <span class="prem-badge free">🆓 FREE USER</span>
+    <span style="font-size:.78rem;color:#aaa">Token: {{ config.tokens|length }}/{{ token_limit }} · Channel: {{ current_token_data.channels|length }}/{{ channel_limit }}</span>
+  </div>
+  <!-- Limit bar Token -->
+  <div style="margin-top:.7rem">
+    <div class="limit-bar"><span style="color:#aaa">Token</span><div class="limit-track"><div class="limit-fill {% if config.tokens|length >= token_limit %}{% else %}ok{% endif %}" style="width:{{ [config.tokens|length * 100 // token_limit, 100]|min }}%"></div></div><span style="color:#aaa">{{ config.tokens|length }}/{{ token_limit }}</span></div>
+    <div class="limit-bar"><span style="color:#aaa">Channel</span><div class="limit-track"><div class="limit-fill {% if current_token_data.channels|length >= channel_limit %}{% else %}{{ 'warn' if current_token_data.channels|length >= (channel_limit - 1) else 'ok' }}{% endif %}" style="width:{{ [current_token_data.channels|length * 100 // channel_limit, 100]|min }}%"></div></div><span style="color:#aaa">{{ current_token_data.channels|length }}/{{ channel_limit }}</span></div>
+  </div>
+  <div style="margin-top:.8rem;font-size:.82rem;color:#aaa;margin-bottom:.6rem">⬆️ Upgrade Premium untuk Unlimited Token & Channel</div>
+  <div class="prem-plans">
+    {% for key, plan in premium_plans.items() %}
+    <div class="plan-card">
+      <span class="plan-emoji">{{ plan.emoji }}</span>
+      <div class="plan-name">{{ plan.label }}</div>
+      <div class="plan-price">{{ plan.price_fmt }}</div>
+      <div class="plan-dur">Unlimited semua fitur</div>
+      <a href="https://saweria.co/BuronanBelang" target="_blank" class="btn-buy">Beli Sekarang</a>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
           <div class="ch-title" style="margin-bottom:1rem"><i class="fas fa-code"></i> Developer &amp; Social</div>
           <p>Developed by <strong style="color:var(--red)">C3B1XHUB</strong></p>
           <div class="social-grid">
-            <a href="https://discord.com/invite/psdQaVEnHt" target="_blank" class="soc-btn soc-discord">
-              <i class="fab fa-discord"></i> Discord Community
+<a href="https://discord.com/invite/psdQaVEnHt" target="_blank" class="soc-btn soc-discord">
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 127.14 96.36" style="flex-shrink:0"><path d="M107.7,8.07A105.15,105.15,0,0,0,81.47,0a72.06,72.06,0,0,0-3.36,6.83A97.68,97.68,0,0,0,49,6.83,72.37,72.37,0,0,0,45.64,0,105.89,105.89,0,0,0,19.39,8.09C2.79,32.65-1.71,56.6.54,80.21h0A105.73,105.73,0,0,0,32.71,96.36,77.7,77.7,0,0,0,39.6,85.25a68.42,68.42,0,0,1-10.85-5.18c.91-.66,1.8-1.34,2.66-2a75.57,75.57,0,0,0,64.32,0c.87.71,1.76,1.39,2.66,2a68.68,68.68,0,0,1-10.87,5.19,77,77,0,0,0,6.89,11.1A105.25,105.25,0,0,0,126.6,80.22h0C129.24,52.84,122.09,29.11,107.7,8.07ZM42.45,65.69C36.18,65.69,31,60,31,53s5-12.74,11.43-12.74S54,46,53.89,53,48.84,65.69,42.45,65.69Zm42.24,0C78.41,65.69,73.25,60,73.25,53s5-12.74,11.44-12.74S96.23,46,96.12,53,91.08,65.69,84.69,65.69Z"/></svg>
+              Discord Community
             </a>
             <a href="https://guns.lol" target="_blank" class="soc-btn soc-guns">
               <i class="fas fa-globe"></i> guns.lol
             </a>
             <a href="https://github.com/LRiqlapa" target="_blank" class="soc-btn soc-github">
-              <i class="fab fa-github"></i> GitHub Profile
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 16 16" style="flex-shrink:0"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+              GitHub Profile
             </a>
             <a href="https://saweria.co/BuronanBelang" target="_blank" class="soc-btn soc-support">
               <i class="fas fa-hand-holding-heart"></i> Support Project
