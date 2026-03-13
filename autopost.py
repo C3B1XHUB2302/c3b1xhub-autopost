@@ -126,7 +126,7 @@ def auto_post(token_data):
 
 # =================== DATABASE ===================
 def get_db():
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
 
     class _CursorWrapper:
         def __init__(self, cur):
@@ -150,7 +150,7 @@ def get_db():
 def init_db():
     if not DATABASE_URL:
         return
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
     cur  = conn.cursor()
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
@@ -2027,7 +2027,10 @@ setTimeout(()=>{document.querySelectorAll('.alert').forEach(a=>{a.style.transiti
 '''
 
 # =================== INIT & RUN ===================
-init_db()
+try:
+    init_db()
+except Exception as e:
+    print(f"[WARNING] init_db failed: {e}")
 
 if __name__ == "__main__":
     load_config()
