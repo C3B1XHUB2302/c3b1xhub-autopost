@@ -6,14 +6,19 @@ from flask import Flask, render_template_string, request, redirect, flash, jsoni
 import json, time, threading, os, requests, secrets
 import psycopg2, psycopg2.extras
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+WIB = timezone(timedelta(hours=7))
+
+def format_wib(ts):
+    """Format timestamp ke waktu WIB."""
+    return datetime.fromtimestamp(ts, tz=WIB).strftime('%d %b %Y %H:%M')
 from urllib.parse import urlencode
 
 app = Flask(__name__)
 
 @app.template_filter('datetimeformat')
 def datetimeformat(value):
-    return datetime.fromtimestamp(int(value)).strftime('%d %b %Y %H:%M')
+    return datetime.fromtimestamp(int(value), tz=WIB).strftime('%d %b %Y %H:%M')
 
 # =================== ENVIRONMENT / CONFIG ===================
 IS_VERCEL  = bool(os.environ.get('VERCEL'))
@@ -29,48 +34,88 @@ DISCORD_REDIRECT_URI  = os.environ.get('DISCORD_REDIRECT_URI', 'http://localhost
 DISCORD_LOG_WEBHOOK   = os.environ.get('DISCORD_LOG_WEBHOOK', '')
 ADMIN_IDS             = [x.strip() for x in os.environ.get('ADMIN_DISCORD_IDS', '').split(',') if x.strip()]
 
-# =================== BOT CONFIG ===================
-config = {"tokens": [], "current_token_index": -1}
-config_loaded = False
+# =================== BOT CONFIG (PER-USER) ===================
+posting_threads = {}
 
-def load_config():
-    global config, config_loaded
-    if config_loaded:
-        return
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, 'r') as f:
-            try:
-                loaded = json.load(f)
-                if 'token' in loaded and 'channels' in loaded:
-                    new_token = {
-                        "name": "Default Bot Token",
-                        "token": loaded.get("token", ""),
-                        "use_webhook": loaded.get("use_webhook", False),
-                        "webhook_url": loaded.get("webhook_url", ""),
-                        "channels": loaded.get("channels", []),
-                        "posting_active": False
-                    }
-                    config["tokens"].append(new_token)
-                    config["current_token_index"] = 0
-                    save_config()
-                else:
-                    config.update(loaded)
-                    if not (0 <= config["current_token_index"] < len(config["tokens"])):
-                        config["current_token_index"] = 0 if config["tokens"] else -1
-            except json.JSONDecodeError:
-                pass
-    config_loaded = True
+def get_user_tokens(discord_id):
+    """Ambil semua token milik user ini dari DB."""
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT * FROM user_tokens WHERE discord_id=%s ORDER BY id ASC',
+        (discord_id,)
+    ).fetchall()
+    conn.close()
+    tokens = []
+    for r in rows:
+        t = dict(r)
+        t['channels'] = json.loads(t['channels'] or '[]')
+        tokens.append(t)
+    return tokens
 
-def save_config():
-    os.makedirs(os.path.dirname(CONFIG_PATH) if os.path.dirname(CONFIG_PATH) else '.', exist_ok=True)
-    with open(CONFIG_PATH, 'w') as f:
-        json.dump(config, f, indent=4)
+def get_current_token(discord_id):
+    """Ambil token yang sedang aktif untuk user ini."""
+    conn = get_db()
+    row = conn.execute(
+        'SELECT current_token_id FROM user_settings WHERE discord_id=%s',
+        (discord_id,)
+    ).fetchone()
+    conn.close()
+    if not row or not row['current_token_id']:
+        tokens = get_user_tokens(discord_id)
+        return tokens[0] if tokens else None
+    conn = get_db()
+    t = conn.execute(
+        'SELECT * FROM user_tokens WHERE id=%s AND discord_id=%s',
+        (row['current_token_id'], discord_id)
+    ).fetchone()
+    conn.close()
+    if not t:
+        return None
+    result = dict(t)
+    result['channels'] = json.loads(result['channels'] or '[]')
+    return result
 
-def get_current_token_data():
-    load_config()
-    if 0 <= config["current_token_index"] < len(config["tokens"]):
-        return config["tokens"][config["current_token_index"]]
-    return None
+def save_token(discord_id, token_data):
+    """Simpan/update token ke DB. token_data harus punya 'id' untuk update."""
+    conn = get_db()
+    channels_json = json.dumps(token_data.get('channels', []))
+    if token_data.get('id'):
+        conn.execute(
+            '''UPDATE user_tokens SET name=%s, token=%s, use_webhook=%s,
+               webhook_url=%s, channels=%s, posting_active=%s
+               WHERE id=%s AND discord_id=%s''',
+            (token_data['name'], token_data['token'],
+             token_data.get('use_webhook', False),
+             token_data.get('webhook_url', ''),
+             channels_json,
+             token_data.get('posting_active', False),
+             token_data['id'], discord_id)
+        )
+    else:
+        conn.execute(
+            '''INSERT INTO user_tokens
+               (discord_id, name, token, use_webhook, webhook_url, channels, posting_active, created_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)''',
+            (discord_id, token_data['name'], token_data['token'],
+             token_data.get('use_webhook', False),
+             token_data.get('webhook_url', ''),
+             channels_json, False, time.time())
+        )
+    conn.commit()
+    conn.close()
+
+def set_current_token(discord_id, token_id):
+    """Set token aktif untuk user ini."""
+    conn = get_db()
+    conn.execute(
+        '''INSERT INTO user_settings (discord_id, current_token_id)
+           VALUES (%s,%s)
+           ON CONFLICT (discord_id) DO UPDATE SET current_token_id=%s''',
+        (discord_id, token_id, token_id)
+    )
+    conn.commit()
+    conn.close()
+
 
 def send_log(message, channel_id=None, success=True, webhook_url=None):
     if webhook_url:
@@ -289,15 +334,25 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
+# Tambahkan TEPAT SEBELUM: def admin_required(f):
+def is_admin_user(discord_id):
+    if discord_id in ADMIN_IDS:
+        return True
+    conn = get_db()
+    row = conn.execute('SELECT is_web_admin FROM users WHERE discord_id=%s', (discord_id,)).fetchone()
+    conn.close()
+    return bool(row and row['is_web_admin'])
+
+
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if 'user' not in session:
             return redirect('/login')
-        # Dev mode = always admin
         if not DISCORD_CLIENT_ID:
             return f(*args, **kwargs)
-        if not ADMIN_IDS or session['user'].get('discord_id') not in ADMIN_IDS:
+        did = session['user'].get('discord_id', '')
+        if not is_admin_user(did):
             flash('Admin access required.', 'danger')
             return redirect('/')
         return f(*args, **kwargs)
@@ -494,6 +549,33 @@ def admin_delete(did):
     flash(f"User {did} has been deleted.", 'success')
     return redirect('/admin')
 
+@app.route('/admin/grant-admin/<did>', methods=['POST'])
+@login_required
+@admin_required
+def admin_grant_admin(did):
+    conn = get_db()
+    conn.execute('UPDATE users SET is_web_admin=1 WHERE discord_id=%s', (did,))
+    conn.commit()
+    conn.close()
+    flash(f'✅ User {did} sekarang menjadi Admin.', 'success')
+    return redirect('/admin')
+
+@app.route('/admin/revoke-admin/<did>', methods=['POST'])
+@login_required
+@admin_required
+def admin_revoke_admin(did):
+    # Tidak bisa revoke admin dari env var
+    if did in ADMIN_IDS:
+        flash('❌ Tidak bisa merevoke admin yang diset via environment variable.', 'danger')
+        return redirect('/admin')
+    conn = get_db()
+    conn.execute('UPDATE users SET is_web_admin=0 WHERE discord_id=%s', (did,))
+    conn.commit()
+    conn.close()
+    flash(f'🗑️ Admin {did} telah direvoke.', 'warning')
+    return redirect('/admin')
+
+
 # =================== PREMIUM ADMIN ROUTES ===================
 @app.route('/admin/set-premium/<did>', methods=['POST'])
 @login_required
@@ -516,8 +598,7 @@ def admin_set_premium(did):
     )
     conn.commit()
     conn.close()
-    flash(f"✅ Premium <strong>{p['label']}</strong> ({p['price_fmt']}) berhasil diaktifkan untuk <strong>{uname}</strong>! Expires: {datetime.fromtimestamp(expires).strftime('%d %b %Y %H:%M')}", 'success')
-    return redirect('/admin')
+    flash(f"✅ Premium {p['label']} ({p['price_fmt']}) berhasil diaktifkan untuk {uname}! Berlaku hingga: {format_wib(expires)}", 'success')    return redirect('/admin')
 
 @app.route('/admin/remove-premium/<did>', methods=['POST'])
 @login_required
@@ -529,7 +610,7 @@ def admin_remove_premium(did):
     conn.execute('UPDATE users SET premium_type=NULL, premium_expires=0 WHERE discord_id=%s', (did,))
     conn.commit()
     conn.close()
-    flash(f"🗑️ Premium user <strong>{uname}</strong> telah dihapus.", 'warning')
+    flash(f"🗑️ Premium user {uname} telah dihapus.", 'warning')
     return redirect('/admin')
 
 # =================== MAIN APP ROUTES ===================
@@ -537,26 +618,38 @@ def admin_remove_premium(did):
 @app.route("/index", methods=["GET"])
 @login_required
 def index():
-    load_config()
-    if not config["tokens"] or config["current_token_index"] == -1:
-        return redirect("/add-new-token")
-    current_token_data = get_current_token_data()
     user       = session.get('user', {})
     discord_id = user.get('discord_id', '')
     is_admin   = user.get('is_admin', False)
-    prem_info  = get_premium_info(discord_id)
-    user_is_premium = is_admin or is_premium(discord_id)
-    token_limit   = None if user_is_premium else FREE_TOKEN_LIMIT
-    channel_limit = None if user_is_premium else FREE_CHANNEL_LIMIT
+
+    tokens = get_user_tokens(discord_id)
+
+    # Kalau belum ada token, tampilkan halaman kosong (JANGAN redirect paksa)
+    if not tokens:
+        return render_template_string(
+            html_template,
+            config_json='{}',
+            tokens=tokens,
+            current_token_data=None,
+            editing=False,
+            prem_info=get_premium_info(discord_id),
+            user_is_premium=is_admin or is_premium(discord_id),
+            token_limit=None if (is_admin or is_premium(discord_id)) else FREE_TOKEN_LIMIT,
+            channel_limit=None if (is_admin or is_premium(discord_id)) else FREE_CHANNEL_LIMIT,
+            premium_plans=PREMIUM_PLANS
+        )
+
+    current_token_data = get_current_token(discord_id)
     return render_template_string(
         html_template,
         config_json=json.dumps(current_token_data, indent=4),
-        config=config, current_token_data=current_token_data,
+        tokens=tokens,
+        current_token_data=current_token_data,
         editing=False,
-        prem_info=prem_info,
-        user_is_premium=user_is_premium,
-        token_limit=token_limit,
-        channel_limit=channel_limit,
+        prem_info=get_premium_info(discord_id),
+        user_is_premium=is_admin or is_premium(discord_id),
+        token_limit=None if (is_admin or is_premium(discord_id)) else FREE_TOKEN_LIMIT,
+        channel_limit=None if (is_admin or is_premium(discord_id)) else FREE_CHANNEL_LIMIT,
         premium_plans=PREMIUM_PLANS
     )
 
@@ -570,15 +663,14 @@ def add_new_token_page():
 @app.route("/register-token", methods=["POST"])
 @login_required
 def register_token():
-    global config
     user       = session.get('user', {})
     discord_id = user.get('discord_id', '')
     is_admin   = user.get('is_admin', False)
 
-    # Cek limit token untuk user biasa (bukan admin & bukan premium)
+    tokens = get_user_tokens(discord_id)
     if not is_admin and not is_premium(discord_id):
-        if len(config["tokens"]) >= FREE_TOKEN_LIMIT:
-            flash(f"❌ Batas token tercapai! User biasa hanya bisa menambahkan {FREE_TOKEN_LIMIT} token. Upgrade ke <strong>Premium</strong> untuk unlimited token.", "danger")
+        if len(tokens) >= FREE_TOKEN_LIMIT:
+            flash(f"❌ Batas token tercapai! Upgrade Premium untuk unlimited token.", "danger")
             return redirect("/add-new-token")
 
     token_name  = request.form.get("token_name", "").strip()
@@ -586,33 +678,24 @@ def register_token():
     if not token_name or not token_value:
         flash("Bot name and token are required.", "danger")
         return redirect("/add-new-token")
-    if any(t['token'] == token_value for t in config["tokens"]):
+    if any(t['token'] == token_value for t in tokens):
         flash("Token already registered.", "warning")
         return redirect("/add-new-token")
-    if any(t['name'] == token_name for t in config["tokens"]):
-        token_name += f" ({len(config['tokens']) + 1})"
-    new_token_data = {
+
+    save_token(discord_id, {
         "name": token_name, "token": token_value,
         "use_webhook": False, "webhook_url": "",
         "channels": [], "posting_active": False
-    }
-    config["tokens"].append(new_token_data)
-    config["current_token_index"] = len(config["tokens"]) - 1
-    save_config()
+    })
     flash(f"Token '{token_name}' registered successfully!", "success")
     return redirect("/")
 
-@app.route("/switch-token/<int:index>", methods=["GET"])
+@app.route("/switch-token/<int:token_id>", methods=["GET"])
 @login_required
-def switch_token(index):
-    global config
-    load_config()
-    if 0 <= index < len(config["tokens"]):
-        config["current_token_index"] = index
-        save_config()
-        flash(f"Switched to: {config['tokens'][index]['name']}", "info")
-    else:
-        flash("Invalid token index.", "danger")
+def switch_token(token_id):
+    discord_id = session.get('user', {}).get('discord_id', '')
+    set_current_token(discord_id, token_id)
+    flash("Token switched!", "info")
     return redirect("/")
 
 @app.route("/save-config", methods=["POST"])
@@ -1308,8 +1391,8 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
                 </td>
                 <td><span style="font-family:monospace;font-size:.78rem;color:var(--muted)">{{ u['discord_id'] }}</span></td>
                 <td><span class="badge b-login">{{ u['login_count'] }}</span></td>
-                <td style="font-size:.78rem;color:var(--muted)">{{ datetime.fromtimestamp(u['first_login']).strftime('%Y-%m-%d') if u['first_login'] else 'N/A' }}</td>
-                <td style="font-size:.78rem;color:var(--muted)">{{ datetime.fromtimestamp(u['last_login']).strftime('%Y-%m-%d %H:%M') if u['last_login'] else 'N/A' }}</td>
+                <td style="font-size:.78rem;color:var(--muted)">{{ datetime.fromtimestamp(u['first_login'], tz=WIB).strftime('%Y-%m-%d') if u['first_login'] else 'N/A' }}</td>
+                <td style="font-size:.78rem;color:var(--muted)">{{ datetime.fromtimestamp(u['last_login'], tz=WIB).strftime('%Y-%m-%d %H:%M') if u['last_login'] else 'N/A' }}</td>
                 <td>
                   {% if u['is_banned'] %}
                   <span class="badge b-banned"><i class="fas fa-ban"></i> Banned</span>
@@ -1334,6 +1417,24 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
                     <form method="post" action="/admin/delete/{{ u['discord_id'] }}" style="display:inline">
                       <button type="submit" class="btn-act ba-neutral" onclick="return confirm('Delete {{ u['username'] }} permanently?')"><i class="fas fa-trash"></i></button>
                     </form>
+                                        <!-- TOMBOL GRANT/REVOKE ADMIN -->
+                    {% if u['discord_id'] not in ADMIN_IDS and not u['is_web_admin'] %}
+                    <form method="post" action="/admin/grant-admin/{{ u['discord_id'] }}"
+                          style="display:inline"
+                          onsubmit="return confirm('Jadikan {{ u[\'username\'] }} sebagai Admin?')">
+                      <button type="submit" class="btn-act" style="background:rgba(245,158,11,.2);color:#f59e0b;border:1px solid rgba(245,158,11,.3)">
+                        <i class="fas fa-crown"></i> Admin
+                      </button>
+                    </form>
+                    {% elif u['is_web_admin'] %}
+                    <form method="post" action="/admin/revoke-admin/{{ u['discord_id'] }}"
+                          style="display:inline"
+                          onsubmit="return confirm('Revoke admin {{ u[\'username\'] }}?')">
+                      <button type="submit" class="btn-act ba-danger">
+                        <i class="fas fa-crown"></i> Revoke
+                      </button>
+                    </form>
+                    {% endif %}
                   </div>
                 </td>
                                 <td>
