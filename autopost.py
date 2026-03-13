@@ -3,7 +3,8 @@
 #  Features: Discord OAuth2, Admin Panel, Vercel Support
 # ============================================================
 from flask import Flask, render_template_string, request, redirect, flash, jsonify, session
-import json, time, threading, os, requests, sqlite3, secrets
+import json, time, threading, os, requests, secrets
+import psycopg2, psycopg2.extras
 from functools import wraps
 from datetime import datetime
 from urllib.parse import urlencode
@@ -18,7 +19,7 @@ def datetimeformat(value):
 IS_VERCEL  = bool(os.environ.get('VERCEL'))
 BASE_DIR   = '/tmp' if IS_VERCEL else '.'
 CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
-DB_PATH     = os.path.join(BASE_DIR, 'users.db')
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
 
 app.secret_key = os.environ.get('SECRET_KEY', 'c3b1xhub-dev-change-this-in-production')
 
@@ -121,54 +122,75 @@ def auto_post(token_data):
         t.start()
     posting_threads[token_name] = channel_threads
 
+# ✅ GANTI TOTAL (Lines 161-203) dengan ini:
+
 # =================== DATABASE ===================
+def get_db():
+    conn = psycopg2.connect(DATABASE_URL)
+
+    class _CursorWrapper:
+        def __init__(self, cur):
+            self._c = cur
+        def fetchone(self):  return self._c.fetchone()
+        def fetchall(self):  return self._c.fetchall()
+        def __getitem__(self, k): return self._c.fetchall()[k]
+
+    class _ConnWrapper:
+        def __init__(self, c):
+            self._conn = c
+        def execute(self, sql, params=None):
+            cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(sql, params)
+            return _CursorWrapper(cur)
+        def commit(self):  self._conn.commit()
+        def close(self):   self._conn.close()
+
+    return _ConnWrapper(conn)
+
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else '.', exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.executescript('''
+    if not DATABASE_URL:
+        return
+    conn = psycopg2.connect(DATABASE_URL)
+    cur  = conn.cursor()
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             discord_id      TEXT PRIMARY KEY,
             username        TEXT,
             global_name     TEXT,
             avatar          TEXT,
             login_count     INTEGER DEFAULT 1,
-            first_login     REAL,
-            last_login      REAL,
+            first_login     DOUBLE PRECISION,
+            last_login      DOUBLE PRECISION,
             is_banned       INTEGER DEFAULT 0,
-            ban_reason      TEXT DEFAULT "",
+            ban_reason      TEXT DEFAULT '',
             premium_type    TEXT DEFAULT NULL,
-            premium_expires REAL DEFAULT 0
-        );
+            premium_expires DOUBLE PRECISION DEFAULT 0
+        )
+    ''')
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS premium_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            id          SERIAL PRIMARY KEY,
             discord_id  TEXT,
             username    TEXT,
             plan        TEXT,
             price       INTEGER,
             granted_by  TEXT,
-            expires_at  REAL,
-            created_at  REAL
-        );
+            expires_at  DOUBLE PRECISION,
+            created_at  DOUBLE PRECISION
+        )
+    ''')
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS activity_log (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            id         SERIAL PRIMARY KEY,
             discord_id TEXT,
             username   TEXT,
             action     TEXT,
             ip         TEXT,
-            timestamp  REAL
-        );
+            timestamp  DOUBLE PRECISION
+        )
     ''')
     conn.commit()
-    # Migration: tambah kolom premium jika DB sudah ada sebelumnya
-    try:
-        conn.execute("ALTER TABLE users ADD COLUMN premium_type TEXT DEFAULT NULL")
-    except:
-        pass
-    try:
-        conn.execute("ALTER TABLE users ADD COLUMN premium_expires REAL DEFAULT 0")
-    except:
-        pass
-    conn.commit()
+    cur.close()
     conn.close()
 
 def get_db():
@@ -189,7 +211,7 @@ def is_premium(discord_id):
     if not discord_id or discord_id == 'local_dev':
         return True  # local dev = bypass semua limit
     conn = get_db()
-    row = conn.execute('SELECT premium_expires FROM users WHERE discord_id=?', (discord_id,)).fetchone()
+    row = conn.execute('SELECT premium_expires FROM users WHERE discord_id=%s', (discord_id,)).fetchone()
     conn.close()
     if not row:
         return False
@@ -199,7 +221,7 @@ def get_premium_info(discord_id):
     if not discord_id or discord_id == 'local_dev':
         return {'type': 'admin', 'label': 'Admin', 'expires': None, 'active': True}
     conn = get_db()
-    row = conn.execute('SELECT premium_type, premium_expires FROM users WHERE discord_id=?', (discord_id,)).fetchone()
+    row = conn.execute('SELECT premium_type, premium_expires FROM users WHERE discord_id=%s', (discord_id,)).fetchone()
     conn.close()
     if not row or not row['premium_expires'] or row['premium_expires'] <= time.time():
         return None
@@ -356,7 +378,7 @@ def auth_callback():
     now      = time.time()
 
     conn     = get_db()
-    existing = conn.execute('SELECT * FROM users WHERE discord_id=?', (did,)).fetchone()
+    existing = conn.execute('SELECT * FROM users WHERE discord_id=%s', (did,)).fetchone()
 
     if existing:
         if existing['is_banned']:
@@ -365,19 +387,19 @@ def auth_callback():
             flash('Your account has been suspended. Contact an admin.', 'danger')
             return redirect('/login')
         conn.execute(
-            'UPDATE users SET username=?, avatar=?, last_login=?, login_count=login_count+1 WHERE discord_id=?',
+            'UPDATE users SET username=%s, avatar=%s, last_login=%s, login_count=login_count+1 WHERE discord_id=%s',
             (username, avatar, now, did)
         )
         is_new = False
     else:
         conn.execute(
-            'INSERT INTO users (discord_id, username, global_name, avatar, first_login, last_login) VALUES (?,?,?,?,?,?)',
+            'INSERT INTO users (discord_id, username, global_name, avatar, first_login, last_login) VALUES (%s,%s,%s,%s,%s,%s)',
             (did, username, d.get('username'), avatar, now, now)
         )
         is_new = True
 
     conn.execute(
-        'INSERT INTO activity_log (discord_id, username, action, ip, timestamp) VALUES (?,?,?,?,?)',
+        'INSERT INTO activity_log (discord_id, username, action, ip, timestamp) VALUES (%s,%s,%s,%s,%s)',
         (did, username, 'register' if is_new else 'login', ip, now)
     )
     conn.commit()
@@ -406,16 +428,16 @@ def logout():
 @admin_required
 def admin_dashboard():
     conn         = get_db()
-    total_users  = conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
-    banned_users = conn.execute('SELECT COUNT(*) FROM users WHERE is_banned=1').fetchone()[0]
-    new_today    = conn.execute(
-        'SELECT COUNT(*) FROM activity_log WHERE timestamp>? AND action="register"',
-        (time.time() - 86400,)
-    ).fetchone()[0]
-    logins_today = conn.execute(
-        'SELECT COUNT(*) FROM activity_log WHERE timestamp>?',
-        (time.time() - 86400,)
-    ).fetchone()[0]
+    total_users  = conn.execute('SELECT COUNT(*) AS cnt FROM users').fetchone()['cnt']
+banned_users = conn.execute('SELECT COUNT(*) AS cnt FROM users WHERE is_banned=1').fetchone()['cnt']
+new_today    = conn.execute(
+    "SELECT COUNT(*) AS cnt FROM activity_log WHERE timestamp>%s AND action='register'",
+    (time.time() - 86400,)
+).fetchone()['cnt']
+logins_today = conn.execute(
+    'SELECT COUNT(*) AS cnt FROM activity_log WHERE timestamp>%s',
+    (time.time() - 86400,)
+).fetchone()['cnt']
     users = conn.execute('SELECT * FROM users ORDER BY last_login DESC').fetchall()
     logs  = conn.execute('SELECT * FROM activity_log ORDER BY timestamp DESC LIMIT 60').fetchall()
     conn.close()
@@ -434,7 +456,7 @@ def admin_ban(did):
     reason = request.form.get('reason', 'Violated terms of use')
     conn   = get_db()
     user   = conn.execute('SELECT * FROM users WHERE discord_id=?', (did,)).fetchone()
-    conn.execute('UPDATE users SET is_banned=1, ban_reason=? WHERE discord_id=?', (reason, did))
+    conn.execute('UPDATE users SET is_banned=1, ban_reason=%s WHERE discord_id=%s', (reason, did))
     conn.commit()
     conn.close()
     if user:
@@ -448,8 +470,8 @@ def admin_ban(did):
 @admin_required
 def admin_unban(did):
     conn = get_db()
-    user = conn.execute('SELECT * FROM users WHERE discord_id=?', (did,)).fetchone()
-    conn.execute('UPDATE users SET is_banned=0, ban_reason="" WHERE discord_id=?', (did,))
+    user = conn.execute('SELECT * FROM users WHERE discord_id=%s', (did,)).fetchone()
+    conn.execute("UPDATE users SET is_banned=0, ban_reason='' WHERE discord_id=%s", (did,))
     conn.commit()
     conn.close()
     if user:
@@ -462,8 +484,8 @@ def admin_unban(did):
 @admin_required
 def admin_delete(did):
     conn = get_db()
-    conn.execute('DELETE FROM users WHERE discord_id=?', (did,))
-    conn.execute('DELETE FROM activity_log WHERE discord_id=?', (did,))
+    conn.execute('DELETE FROM users WHERE discord_id=%s', (did,))
+    conn.execute('DELETE FROM activity_log WHERE discord_id=%s', (did,))
     conn.commit()
     conn.close()
     flash(f"User {did} has been deleted.", 'success')
@@ -482,11 +504,11 @@ def admin_set_premium(did):
     expires  = time.time() + p['duration']
     admin_id = session.get('user', {}).get('discord_id', 'unknown')
     conn     = get_db()
-    user_row = conn.execute('SELECT username FROM users WHERE discord_id=?', (did,)).fetchone()
+    user_row = conn.execute('SELECT username FROM users WHERE discord_id=%s', (did,)).fetchone()
     uname    = user_row['username'] if user_row else 'Unknown'
-    conn.execute('UPDATE users SET premium_type=?, premium_expires=? WHERE discord_id=?', (plan, expires, did))
+    conn.execute('UPDATE users SET premium_type=%s, premium_expires=%s WHERE discord_id=%s', (plan, expires, did))
     conn.execute(
-        'INSERT INTO premium_log (discord_id, username, plan, price, granted_by, expires_at, created_at) VALUES (?,?,?,?,?,?,?)',
+        'INSERT INTO premium_log (discord_id, username, plan, price, granted_by, expires_at, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)',
         (did, uname, plan, p['price'], admin_id, expires, time.time())
     )
     conn.commit()
@@ -499,9 +521,9 @@ def admin_set_premium(did):
 @admin_required
 def admin_remove_premium(did):
     conn     = get_db()
-    user_row = conn.execute('SELECT username FROM users WHERE discord_id=?', (did,)).fetchone()
+    user_row = conn.execute('SELECT username FROM users WHERE discord_id=%s', (did,)).fetchone()
     uname    = user_row['username'] if user_row else 'Unknown'
-    conn.execute('UPDATE users SET premium_type=NULL, premium_expires=0 WHERE discord_id=?', (did,))
+    conn.execute('UPDATE users SET premium_type=NULL, premium_expires=0 WHERE discord_id=%s', (did,))
     conn.commit()
     conn.close()
     flash(f"🗑️ Premium user <strong>{uname}</strong> telah dihapus.", 'warning')
