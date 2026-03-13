@@ -598,7 +598,8 @@ def admin_set_premium(did):
     )
     conn.commit()
     conn.close()
-    flash(f"✅ Premium {p['label']} ({p['price_fmt']}) berhasil diaktifkan untuk {uname}! Berlaku hingga: {format_wib(expires)}", 'success')    return redirect('/admin')
+        flash(f"✅ Premium {p['label']} ({p['price_fmt']}) berhasil diaktifkan untuk {uname}! Berlaku hingga: {format_wib(expires)}", 'success')
+    return redirect('/admin')
 
 @app.route('/admin/remove-premium/<did>', methods=['POST'])
 @login_required
