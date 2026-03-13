@@ -193,11 +193,6 @@ def init_db():
     cur.close()
     conn.close()
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 # =================== PREMIUM HELPERS ===================
 PREMIUM_PLANS = {
     '1day':   {'label': '1 Hari',   'emoji': '⚡', 'price': 5000,   'duration': 86400,    'price_fmt': 'Rp 5.000'},
