@@ -429,25 +429,33 @@ def logout():
 def admin_dashboard():
     conn         = get_db()
     total_users  = conn.execute('SELECT COUNT(*) AS cnt FROM users').fetchone()['cnt']
-banned_users = conn.execute('SELECT COUNT(*) AS cnt FROM users WHERE is_banned=1').fetchone()['cnt']
-new_today    = conn.execute(
-    "SELECT COUNT(*) AS cnt FROM activity_log WHERE timestamp>%s AND action='register'",
-    (time.time() - 86400,)
-).fetchone()['cnt']
-logins_today = conn.execute(
-    'SELECT COUNT(*) AS cnt FROM activity_log WHERE timestamp>%s',
-    (time.time() - 86400,)
-).fetchone()['cnt']
+    banned_users = conn.execute('SELECT COUNT(*) AS cnt FROM users WHERE is_banned=1').fetchone()['cnt']
+    new_today    = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM activity_log WHERE timestamp>%s AND action='register'",
+        (time.time() - 86400,)
+    ).fetchone()['cnt']
+    logins_today = conn.execute(
+        'SELECT COUNT(*) AS cnt FROM activity_log WHERE timestamp>%s',
+        (time.time() - 86400,)
+    ).fetchone()['cnt']
     users = conn.execute('SELECT * FROM users ORDER BY last_login DESC').fetchall()
     logs  = conn.execute('SELECT * FROM activity_log ORDER BY timestamp DESC LIMIT 60').fetchall()
     conn.close()
     load_config()
-    return render_template_string(admin_template,
-        total_users=total_users, banned_users=banned_users,
-        new_today=new_today, logins_today=logins_today,
-        users=users, logs=logs, config=config,
-        ADMIN_IDS=ADMIN_IDS, datetime=datetime, now=time.time()
+    return render_template_string(
+        admin_template,
+        total_users=total_users,
+        banned_users=banned_users,
+        new_today=new_today,
+        logins_today=logins_today,
+        users=users,
+        logs=logs,
+        config=config,
+        ADMIN_IDS=ADMIN_IDS,
+        datetime=datetime,
+        now=time.time()
     )
+
 
 @app.route('/admin/ban/<did>', methods=['POST'])
 @login_required
